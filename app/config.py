@@ -1,0 +1,17 @@
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+
+GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID")
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "credentials.json")
+
+PROFESSIONAL_NAME = os.getenv("PROFESSIONAL_NAME", "El profesional")
+PROFESSIONAL_ADDRESS = os.getenv("PROFESSIONAL_ADDRESS", "")
+PROFESSIONAL_SCHEDULE = os.getenv("PROFESSIONAL_SCHEDULE", "")
+SESSION_DURATION_MINUTES = int(os.getenv("SESSION_DURATION_MINUTES", "50"))
+SLOT_ADVANCE_DAYS = int(os.getenv("SLOT_ADVANCE_DAYS", "14"))
