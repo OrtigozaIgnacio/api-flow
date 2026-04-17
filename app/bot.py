@@ -14,8 +14,12 @@ def _get_professional(phone_number_id: str) -> Professional | None:
 
 def _get_session(phone_number_id: str, patient_phone: str) -> dict:
     db = SessionLocal()
+    prof = _get_professional(phone_number_id)
+    if not prof:
+        return {"step": "menu", "data": {}}
+
     row = db.query(ConversationSession).filter_by(
-        phone_number_id=phone_number_id,
+        professional_id=prof.id, # <--- Cambio clave
         patient_phone=patient_phone,
     ).first()
     db.close()
@@ -26,8 +30,12 @@ def _get_session(phone_number_id: str, patient_phone: str) -> dict:
 
 def _save_session(phone_number_id: str, patient_phone: str, session: dict):
     db = SessionLocal()
+    prof = _get_professional(phone_number_id)
+    if not prof:
+        return
+
     row = db.query(ConversationSession).filter_by(
-        phone_number_id=phone_number_id,
+        professional_id=prof.id, # <--- Cambio clave
         patient_phone=patient_phone,
     ).first()
     if row:
@@ -35,7 +43,7 @@ def _save_session(phone_number_id: str, patient_phone: str, session: dict):
         row.data = json.dumps(session["data"])
     else:
         db.add(ConversationSession(
-            phone_number_id=phone_number_id,
+            professional_id=prof.id, # <--- Cambio clave
             patient_phone=patient_phone,
             step=session["step"],
             data=json.dumps(session["data"]),
