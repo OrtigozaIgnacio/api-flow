@@ -4,9 +4,13 @@ import httpx
 from app.config import VERIFY_TOKEN
 from app.bot import handle_message
 from app.database import init_db
-from app.database import SessionLocal, ProcessedMessage
+from app.database import SessionLocal, ProcessedMessage, Professional, Appointment
 from app.scheduler import start_scheduler
 from sqlalchemy.exc import IntegrityError
+from app.vision import process_payment_receipt
+from app.whatsapp import send_message
+
+
 
 app = FastAPI()
 
@@ -46,7 +50,7 @@ async def receive_message(request: Request):
         from_num        = msg["from"]
         msg_type        = msg.get("type")
 
-        # Deduplicación persistente en DB
+        # 1. Deduplicación persistente en DB
         db = SessionLocal()
         try:
             db.add(ProcessedMessage(msg_id=msg_id))
@@ -54,73 +58,96 @@ async def receive_message(request: Request):
         except IntegrityError:
             db.rollback()
             db.close()
-            print(f"[WEBHOOK] Duplicado ignorado (race condition): {msg_id}")
+            print(f"[WEBHOOK] Duplicado ignorado: {msg_id}")
             return {"status": "duplicate"}
-        finally:
-            db.close()
 
         print(f"[WEBHOOK] phone_number_id={phone_number_id} | from={from_num} | tipo={msg_type}")
 
+        # 2. PROCESAMIENTO DE TEXTO (Agendamiento inicial)
         if msg_type == "text":
             text = msg["text"]["body"].strip()
+            print(f"[WEBHOOK] Texto recibido: '{text}'")
+            await handle_message(phone_number_id, from_num, text)
+
         elif msg_type == "interactive":
             text = msg["interactive"]["button_reply"]["id"]
+            print(f"[WEBHOOK] Botón recibido: '{text}'")
+            await handle_message(phone_number_id, from_num, text)
+
+        # 3. PROCESAMIENTO DE IMAGEN (Validación de Pago y Cierre de Turno)
+        elif msg_type == "image":
+            media_id = msg["image"]["id"]
+            print(f"[WEBHOOK] Imagen recibida. Media ID: {media_id}")
+
+            # A. Buscar Profesional y Turno Pendiente
+            prof = db.query(Professional).filter_by(phone_number_id=phone_number_id).first()
+            turno_pendiente = db.query(Appointment).filter_by(
+                professional_id=prof.id,
+                patient_phone=from_num,
+                status="pending"
+            ).first() if prof else None
+
+            if not prof or not turno_pendiente:
+                await send_message(to=from_num, text="No encontramos un turno pendiente para validar. Por favor, iniciá el agendamiento escribiendo 'Hola'.", phone_number_id=phone_number_id)
+                db.close()
+                return {"status": "no_context"}
+
+            # B. Validación con Gemini Vision
+            fecha_esperada = turno_pendiente.start_at[:10]
+            resultado = await process_payment_receipt(
+                media_id=media_id,
+                expected_amount=prof.session_price,
+                prof_name=prof.name,
+                expected_date=fecha_esperada
+            )
+
+            if resultado.is_valid_receipt and resultado.status == "approved" and resultado.date_match:
+                # C. ÉXITO: Actualizar DB
+                turno_pendiente.status = "confirmed"
+                turno_pendiente.is_billed = True
+                db.commit()
+
+                # D. AGENDAR EN GOOGLE CALENDAR
+                try:
+                    from app.calendar_service import create_event
+                    event_id = await create_event(
+                        calendar_id=prof.calendar_id,
+                        start_time=turno_pendiente.start_at,
+                        end_time=turno_pendiente.end_at,
+                        summary=f"Turno: {turno_pendiente.patient_name}",
+                        description=f"Pago validado por IA.\nPaciente: {turno_pendiente.patient_name}\nTel: {from_num}"
+                    )
+                    turno_pendiente.calendar_event_id = event_id
+                    db.commit()
+                except Exception as e:
+                    print(f"[CALENDAR] Error al sincronizar: {e}")
+
+                # E. MENSAJE FINAL DE CONFIRMACIÓN
+                hora_turno = turno_pendiente.start_at[11:16]
+                mensaje_exito = (
+                    f"✅ *¡Turno Confirmado!*\n\n"
+                    f"📅 *Fecha:* {fecha_esperada}\n"
+                    f"⏰ *Hora:* {hora_turno} hs\n"
+                    f"📍 *Dirección:* {prof.address}\n\n"
+                    f"¡Te esperamos! Se ha enviado un evento a la agenda del profesional."
+                )
+                await send_message(to=from_num, text=mensaje_exito, phone_number_id=phone_number_id)
+            
+            else:
+                await send_message(to=from_num, text="❌ No pudimos validar el comprobante. Por favor, verificá que el monto, la fecha y el destinatario sean correctos y volvé a enviarlo.", phone_number_id=phone_number_id)
+
         else:
             print(f"[WEBHOOK] Tipo no soportado: {msg_type}")
-            return {"status": "unsupported_type"}
 
-        print(f"[WEBHOOK] Texto recibido: '{text}'")
-        await handle_message(phone_number_id, from_num, text)
+        db.close()
 
-    except (KeyError, IndexError) as e:
-        print(f"[WEBHOOK] Error parseando body: {e}")
+    except Exception as e:
+        print(f"[WEBHOOK] Error crítico: {e}")
+        if 'db' in locals(): db.close()
 
     return {"status": "ok"}
 
 
-def _normalize_phone(phone: str) -> str:
-    """
-    Meta a veces rechaza números argentinos con el 9 incluido.
-    Si el envío falla, el fallback intenta sin el 9.
-    """
-    phone = phone.strip().lstrip("+")
-    return phone
 
 
-async def send_message(to: str, text: str, phone_number_id: str):
-    from app.config import WHATSAPP_TOKEN
-    url     = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
 
-    # Intentar primero con el número tal como llegó
-    # Si falla 131030, intentar sin el 9 (formato alternativo Argentina)
-    numbers_to_try = [to]
-    if to.startswith("549") and len(to) == 13:
-        numbers_to_try.append("54" + to[3:])  # sacar el 9
-
-    async with httpx.AsyncClient() as client:
-        for number in numbers_to_try:
-            payload = {
-                "messaging_product": "whatsapp",
-                "to": number,
-                "type": "text",
-                "text": {"body": text},
-            }
-            print(f"[SEND] Intentando enviar a {number}")
-            try:
-                response = await client.post(url, json=payload, headers=headers)
-                print(f"[SEND] Respuesta Meta: {response.status_code}")
-                if response.status_code == 200:
-                    return  # éxito
-                data = response.json()
-                if data.get("error", {}).get("code") == 131030 and len(numbers_to_try) > 1:
-                    print(f"[SEND] Número {number} no autorizado, probando formato alternativo...")
-                    continue
-                response.raise_for_status()
-            except Exception as e:
-                print(f"[SEND] ERROR: {e}")
-                if number == numbers_to_try[-1]:
-                    raise

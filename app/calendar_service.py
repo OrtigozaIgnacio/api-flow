@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from google.oauth2 import service_account
@@ -8,9 +8,7 @@ from googleapiclient.discovery import build
 
 from app.database import Professional, SessionLocal, WorkingHours
 
-SCOPES     = ["https://www.googleapis.com/auth/calendar"]
-TIMEZONE   = "America/Argentina/Buenos_Aires"
-TZ         = ZoneInfo(TIMEZONE)
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
 def _get_calendar_service(prof: Professional):
@@ -90,7 +88,7 @@ async def get_available_slots(
 ) -> list[dict]:
     service = _get_calendar_service(prof)
 
-    now        = datetime.now(tz=TZ)
+    now        = datetime.now(tz=ZoneInfo(prof.timezone))
     end_search = now + timedelta(days=prof.slot_advance_days)
 
     events_result = service.events().list(
@@ -107,15 +105,16 @@ async def get_available_slots(
         end   = event["end"].get("dateTime")
         if start and end:
             busy_blocks.append((
-                datetime.fromisoformat(start).astimezone(TZ),
-                datetime.fromisoformat(end).astimezone(TZ),
+                datetime.fromisoformat(start).astimezone(ZoneInfo(prof.timezone)),
+                datetime.fromisoformat(end).astimezone(ZoneInfo(prof.timezone)),
             ))
 
     start_from = now + timedelta(hours=2)
     candidates = _candidate_slots(prof, start_from, count=30)
 
     if preference:
-        candidates = _filter_by_preference(candidates, preference)
+        # Ahora pasamos el profesional para que sepa en qué país está
+        candidates = _filter_by_preference(prof, candidates, preference)
 
     duration = timedelta(minutes=prof.session_minutes)
     free_slots = []
@@ -142,7 +141,7 @@ async def get_available_slots(
     ]
 
 
-def _filter_by_preference(candidates: list[datetime], preference: str) -> list[datetime]:
+def _filter_by_preference(prof: Professional, candidates: list[datetime], preference: str) -> list[datetime]:
     import re
     pref = preference.lower()
 
@@ -183,7 +182,8 @@ def _filter_by_preference(candidates: list[datetime], preference: str) -> list[d
 
     next_week = None
     if "semana que viene" in pref or "próxima semana" in pref or "proxima semana" in pref:
-        today     = datetime.now(tz=TZ).date()
+        # AQUÍ ESTABA EL ERROR: Usamos la zona horaria del profesional
+        today      = datetime.now(tz=ZoneInfo(prof.timezone)).date()
         days_ahead = 7 - today.weekday()
         next_week  = today + timedelta(days=days_ahead)
 
@@ -258,3 +258,15 @@ async def unblock_slot(slot: dict, prof: Professional):
         ).execute()
     except Exception as e:
         print(f"[ERROR] No se pudo liberar el evento {event_id}: {e}")
+
+async def create_event(calendar_id: str, start_time: str, end_time: str, summary: str, description: str, prof: Professional):
+    """Crea el evento final una vez validado el pago."""
+    service = _get_calendar_service(prof)
+    event = {
+        "summary": summary,
+        "description": description,
+        "start": {"dateTime": start_time, "timeZone": prof.timezone},
+        "end": {"dateTime": end_time, "timeZone": prof.timezone},
+    }
+    created = service.events().insert(calendarId=calendar_id, body=event).execute()
+    return created["id"]

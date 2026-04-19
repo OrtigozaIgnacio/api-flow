@@ -1,6 +1,10 @@
 import json
+import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from app.database import SessionLocal, Professional, ConversationSession
 from app.intent import classify_intent
+from app.whatsapp import send_message
 
 
 def _get_professional(phone_number_id: str) -> Professional | None:
@@ -80,22 +84,24 @@ def _update_appointment_status(apt_id: str, status: str):
 
 
 async def handle_message(phone_number_id: str, patient_phone: str, text: str):
-    from app.main import send_message
-
     prof = _get_professional(phone_number_id)
     if not prof:
         return
+
+    # Inyectamos la hora local del profesional
+    prof_tz = ZoneInfo(prof.timezone)
+    now_str = datetime.now(tz=prof_tz).strftime("%A, %d de %B de %Y - %H:%M")
 
     text    = text.strip()
     session = _get_session(phone_number_id, patient_phone)
     step    = session["step"]
 
     async def reply(msg: str):
-        await send_message(patient_phone, msg, phone_number_id)
+        # Usamos kwargs explícitos para no cruzar los argumentos de destino
+        await send_message(to=patient_phone, text=msg, phone_number_id=phone_number_id)
 
-    # Mensaje de bienvenida — primera vez o si el paciente saluda
     WELCOME = (
-        f"¡Hola! 👋 Soy el asistente de {prof.name}.\n"
+        f"¡Hola! 👋 Soy el asistente de {prof.title} {prof.name}.\n"
         "¿En qué te puedo ayudar? ¿Querés agendar un turno?"
     )
 
@@ -106,7 +112,6 @@ async def handle_message(phone_number_id: str, patient_phone: str, text: str):
         "¿Querés que te busque un turno disponible?"
     )
 
-    # Si el paciente saluda o quiere volver al inicio
     if text.lower() in ("hola", "buenas", "buen día", "buenos días",
                          "buenas tardes", "buenas noches", "inicio", "menu", "start"):
         session = {"step": "menu", "data": {}}
@@ -114,8 +119,6 @@ async def handle_message(phone_number_id: str, patient_phone: str, text: str):
         await reply(WELCOME)
         return
 
-    # Si el paciente ya tiene turno confirmado y escribe algo nuevo,
-    # tratarlo como si estuviera en el menú
     if step == "confirmed":
         session["step"] = "menu"
         step = "menu"
@@ -123,7 +126,7 @@ async def handle_message(phone_number_id: str, patient_phone: str, text: str):
 
     # ── Menú ──
     if step == "menu":
-        intent = await classify_intent("menu", text)
+        intent = await classify_intent("menu", text, local_time_str=now_str)
 
         if intent == "schedule":
             session["step"] = "loading_slots"
@@ -135,7 +138,6 @@ async def handle_message(phone_number_id: str, patient_phone: str, text: str):
             await reply(INFO)
 
         elif intent == "unclear":
-            # Primera vez que escribe: probablemente es un saludo o mensaje ambiguo
             session = {"step": "menu", "data": {}}
             _save_session(phone_number_id, patient_phone, session)
             await reply(WELCOME)
@@ -199,18 +201,13 @@ async def _send_slots(phone_number_id, patient_phone, prof, session, reply):
 async def _handle_slot_choice(phone_number_id, patient_phone, text, session, prof, reply):
     from app.calendar_service import block_slot
     from app.scheduler import schedule_reminder
-    import re
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
+    
     slots = session["data"].get("available_slots", [])
-    TZ    = ZoneInfo("America/Argentina/Buenos_Aires")
+    prof_tz = ZoneInfo(prof.timezone)
+    now_str = datetime.now(tz=prof_tz).strftime("%A, %d de %B de %Y - %H:%M")
 
     selected_slot = None
 
-    # ── Matching directo por hora ──
-    # Solo matchea "las 14", "las 14:50" o formato explícito "14:50"
-    # Evita confundir el día del mes (ej: "lunes 6") con la hora
     time_match = re.search(
         r'(?:las?\s+(\d{1,2})(?::(\d{2}))?|(\d{1,2}):(\d{2}))\s*(?:hs?)?',
         text.lower()
@@ -224,7 +221,7 @@ async def _handle_slot_choice(phone_number_id, patient_phone, text, session, pro
             minute = int(time_match.group(4))
 
         for slot in slots:
-            slot_dt = datetime.fromisoformat(slot["start"]).astimezone(TZ)
+            slot_dt = datetime.fromisoformat(slot["start"]).astimezone(prof_tz)
             if slot_dt.hour == hour and slot_dt.minute == minute:
                 selected_slot = slot
                 break
@@ -236,9 +233,8 @@ async def _handle_slot_choice(phone_number_id, patient_phone, text, session, pro
             )
             return
 
-    # ── Si no encontró por hora, usar Gemini ──
     if not selected_slot:
-        intent   = await classify_intent("awaiting_slot_selection", text)
+        intent   = await classify_intent("awaiting_slot_selection", text, local_time_str=now_str)
         slot_map = {"select_a": 0, "select_b": 1, "select_c": 2}
 
         if intent in slot_map:
@@ -284,21 +280,27 @@ async def _handle_slot_choice(phone_number_id, patient_phone, text, session, pro
         "appointment_id":  apt_id,
         "unclear_count":   0,
     }
-    session["step"] = "confirmed"
+    # Lo dejamos en pending visualmente para que sepa que falta el pago,
+    # aunque a nivel chatbot vuelve al inicio
+    session["step"] = "menu"
     _save_session(phone_number_id, patient_phone, session)
     
     schedule_reminder(phone_number_id, patient_phone, selected_slot, prof.name)
 
     await reply(
-        f"¡Listo! 🎉 Te reservé el turno para el {selected_slot['display']}.\n\n"
-        "Te voy a escribir el día anterior para confirmar. ¡Hasta entonces!"
+        f"¡Listo! 🎉 Te reservé el lugar para el {selected_slot['display']}.\n\n"
+        f"Para confirmar el turno definitivamente, por favor enviá una foto o captura del comprobante de transferencia por el valor de la consulta.\n"
+        f"Te espero."
     )
 
 
 async def _handle_preference(phone_number_id, patient_phone, text, session, prof, reply):
     from app.calendar_service import get_available_slots
+    
+    prof_tz = ZoneInfo(prof.timezone)
+    now_str = datetime.now(tz=prof_tz).strftime("%A, %d de %B de %Y - %H:%M")
 
-    intent = await classify_intent("awaiting_preference", text)
+    intent = await classify_intent("awaiting_preference", text, local_time_str=now_str)
 
     if intent == "see_more":
         slots = await get_available_slots(prof, skip=3)
@@ -335,8 +337,11 @@ async def _handle_confirmation(phone_number_id, patient_phone, text, session, pr
     from app.calendar_service import unblock_slot
     from app.scheduler import cancel_reminder
 
+    prof_tz = ZoneInfo(prof.timezone)
+    now_str = datetime.now(tz=prof_tz).strftime("%A, %d de %B de %Y - %H:%M")
+
     slot   = session["data"].get("confirmed_slot")
-    intent = await classify_intent("awaiting_confirmation", text)
+    intent = await classify_intent("awaiting_confirmation", text, local_time_str=now_str)
 
     if intent == "confirm":
         apt_id = session["data"].get("appointment_id")
