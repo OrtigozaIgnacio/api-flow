@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from sqlalchemy import (
     create_engine, Column, String, Integer,
-    Boolean, Text, UniqueConstraint
+    Boolean, Text, UniqueConstraint, Float
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -49,6 +49,7 @@ class Professional(Base):
     slot_advance_days = Column(Integer, default=14)
     active            = Column(Boolean, default=True)
     created_at        = Column(String, default=lambda: datetime.utcnow().isoformat())
+    session_price = Column(Float, default=50000.0)
 
 
 class WorkingHours(Base):
@@ -89,6 +90,7 @@ class Appointment(Base):
     end_at            = Column(String, nullable=False)
     calendar_event_id = Column(String, default="")
     status            = Column(String, default="pending")
+    is_billed         = Column(Boolean, default=False)
     reminder_sent_at  = Column(String, default="")
     created_at        = Column(String, default=lambda: datetime.utcnow().isoformat())
 

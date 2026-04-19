@@ -1,11 +1,8 @@
 import os
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
-TIMEZONE = "America/Argentina/Buenos_Aires"
-TZ       = ZoneInfo(TIMEZONE)
 
 # Usamos la misma DB de Supabase para evitar que Render borre los jobs
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./bot.db")
@@ -14,7 +11,8 @@ jobstores = {
     "default": SQLAlchemyJobStore(url=DATABASE_URL)
 }
 
-scheduler = AsyncIOScheduler(jobstores=jobstores, timezone=TIMEZONE)
+# El scheduler maestro corre en UTC para no confundirse con los países
+scheduler = AsyncIOScheduler(jobstores=jobstores, timezone="UTC")
 
 
 def start_scheduler():
@@ -29,7 +27,7 @@ async def _send_reminder(
     prof_name: str,
 ):
     """Se ejecuta automáticamente 24 hs antes del turno."""
-    from app.main import send_message
+    from app.whatsapp import send_message  # <-- Import corregido para evitar circularidad
     from app.database import SessionLocal, ConversationSession
     import json
 
@@ -62,9 +60,12 @@ def schedule_reminder(
     slot: dict,
     prof_name: str,
 ):
+    # La fecha del slot ya viene con su zona horaria correcta desde Google
     slot_start  = datetime.fromisoformat(slot["start"])
     reminder_at = slot_start - timedelta(hours=24)
-    now         = datetime.now(tz=TZ)
+    
+    # Obtenemos la hora actual en UTC para comparar peras con peras
+    now = datetime.now(tz=timezone.utc)
 
     if reminder_at <= now:
         reminder_at = now + timedelta(minutes=1)
