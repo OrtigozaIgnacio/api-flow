@@ -19,16 +19,14 @@ else:
         DATABASE_URL,
         pool_size=5,
         max_overflow=10,
-        pool_pre_ping=True,   # reconecta si la conexión cayó
+        pool_pre_ping=True,
     )
 
 SessionLocal = sessionmaker(bind=engine)
 Base         = declarative_base()
 
-
 def _uuid():
     return str(uuid.uuid4())
-
 
 class Professional(Base):
     __tablename__ = "professionals"
@@ -47,10 +45,14 @@ class Professional(Base):
     credentials_file  = Column(String, nullable=False)
     session_minutes   = Column(Integer, default=50)
     slot_advance_days = Column(Integer, default=14)
+    session_price     = Column(Float, default=50000.0)
     active            = Column(Boolean, default=True)
+    
+    # --- NUEVOS CAMPOS PARA EL PANEL DE CONTROL ---
+    subscription_due_date = Column(String, nullable=True) # Fecha de vencimiento
+    last_payment_date     = Column(String, nullable=True) # Fecha del último pago
+    
     created_at        = Column(String, default=lambda: datetime.utcnow().isoformat())
-    session_price = Column(Float, default=50000.0)
-
 
 class WorkingHours(Base):
     __tablename__ = "working_hours"
@@ -61,7 +63,6 @@ class WorkingHours(Base):
     start_time      = Column(String, nullable=False)
     end_time        = Column(String, nullable=False)
     active          = Column(Boolean, default=True)
-
 
 class ConversationSession(Base):
     __tablename__ = "conversation_sessions"
@@ -78,7 +79,6 @@ class ConversationSession(Base):
         UniqueConstraint("professional_id", "patient_phone", name="uq_session"),
     )
 
-
 class Appointment(Base):
     __tablename__ = "appointments"
 
@@ -94,17 +94,14 @@ class Appointment(Base):
     reminder_sent_at  = Column(String, default="")
     created_at        = Column(String, default=lambda: datetime.utcnow().isoformat())
 
-
 class ProcessedMessage(Base):
     __tablename__ = "processed_messages"
 
     msg_id     = Column(String, primary_key=True)
     created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
 
-
 def init_db():
     Base.metadata.create_all(bind=engine)
-
 
 def get_db():
     db = SessionLocal()

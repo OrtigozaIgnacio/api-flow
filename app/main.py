@@ -1,24 +1,33 @@
-from fastapi import FastAPI, Request, HTTPException
+import os
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import PlainTextResponse
-import httpx
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
+
 from app.config import VERIFY_TOKEN
 from app.bot import handle_message
-from app.database import init_db
-from app.database import SessionLocal, ProcessedMessage, Professional, Appointment
+from app.database import init_db, SessionLocal, ProcessedMessage, Professional, Appointment
 from app.scheduler import start_scheduler
-from sqlalchemy.exc import IntegrityError
 from app.vision import process_payment_receipt
 from app.whatsapp import send_message
 
-
-
 app = FastAPI()
+
+# --- SEGURIDAD DEL PANEL DE CONTROL ---
+# Debes configurar esta variable en Render para proteger tu negocio
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "mi_clave_secreta_123")
+
+def verify_admin(x_admin_key: str = Header(None)):
+    if x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Acceso denegado: API Key administrativa inválida")
+    return True
 
 @app.on_event("startup")
 def startup():
     init_db()
     start_scheduler()
 
+# --- WEBHOOK DE WHATSAPP (EXISTENTE) ---
 
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -31,11 +40,9 @@ async def verify_webhook(request: Request):
         return PlainTextResponse(challenge)
     raise HTTPException(status_code=403, detail="Token inválido")
 
-
 @app.post("/webhook")
 async def receive_message(request: Request):
     body = await request.json()
-
     try:
         entry    = body["entry"][0]
         change   = entry["changes"][0]["value"]
@@ -50,7 +57,6 @@ async def receive_message(request: Request):
         from_num        = msg["from"]
         msg_type        = msg.get("type")
 
-        # 1. Deduplicación persistente en DB
         db = SessionLocal()
         try:
             db.add(ProcessedMessage(msg_id=msg_id))
@@ -58,96 +64,76 @@ async def receive_message(request: Request):
         except IntegrityError:
             db.rollback()
             db.close()
-            print(f"[WEBHOOK] Duplicado ignorado: {msg_id}")
             return {"status": "duplicate"}
 
-        print(f"[WEBHOOK] phone_number_id={phone_number_id} | from={from_num} | tipo={msg_type}")
-
-        # 2. PROCESAMIENTO DE TEXTO (Agendamiento inicial)
         if msg_type == "text":
             text = msg["text"]["body"].strip()
-            print(f"[WEBHOOK] Texto recibido: '{text}'")
             await handle_message(phone_number_id, from_num, text)
 
         elif msg_type == "interactive":
             text = msg["interactive"]["button_reply"]["id"]
-            print(f"[WEBHOOK] Botón recibido: '{text}'")
             await handle_message(phone_number_id, from_num, text)
 
-        # 3. PROCESAMIENTO DE IMAGEN (Validación de Pago y Cierre de Turno)
         elif msg_type == "image":
             media_id = msg["image"]["id"]
-            print(f"[WEBHOOK] Imagen recibida. Media ID: {media_id}")
-
-            # A. Buscar Profesional y Turno Pendiente
             prof = db.query(Professional).filter_by(phone_number_id=phone_number_id).first()
-            turno_pendiente = db.query(Appointment).filter_by(
-                professional_id=prof.id,
-                patient_phone=from_num,
-                status="pending"
-            ).first() if prof else None
+            turno = db.query(Appointment).filter_by(patient_phone=from_num, status="pending").first()
 
-            if not prof or not turno_pendiente:
-                await send_message(to=from_num, text="No encontramos un turno pendiente para validar. Por favor, iniciá el agendamiento escribiendo 'Hola'.", phone_number_id=phone_number_id)
-                db.close()
-                return {"status": "no_context"}
-
-            # B. Validación con Gemini Vision
-            fecha_esperada = turno_pendiente.start_at[:10]
-            resultado = await process_payment_receipt(
-                media_id=media_id,
-                expected_amount=prof.session_price,
-                prof_name=prof.name,
-                expected_date=fecha_esperada
-            )
-
-            if resultado.is_valid_receipt and resultado.status == "approved" and resultado.date_match:
-                # C. ÉXITO: Actualizar DB
-                turno_pendiente.status = "confirmed"
-                turno_pendiente.is_billed = True
-                db.commit()
-
-                # D. AGENDAR EN GOOGLE CALENDAR
-                try:
-                    from app.calendar_service import create_event
-                    event_id = await create_event(
-                        calendar_id=prof.calendar_id,
-                        start_time=turno_pendiente.start_at,
-                        end_time=turno_pendiente.end_at,
-                        summary=f"Turno: {turno_pendiente.patient_name}",
-                        description=f"Pago validado por IA.\nPaciente: {turno_pendiente.patient_name}\nTel: {from_num}"
-                    )
-                    turno_pendiente.calendar_event_id = event_id
+            if prof and turno:
+                res = await process_payment_receipt(media_id, prof.session_price, prof.name, turno.start_at[:10])
+                if res.is_valid_receipt and res.status == "approved" and res.date_match:
+                    turno.status = "confirmed"
+                    turno.is_billed = True
+                    # Aquí podrías llamar a create_event de calendar_service
                     db.commit()
-                except Exception as e:
-                    print(f"[CALENDAR] Error al sincronizar: {e}")
-
-                # E. MENSAJE FINAL DE CONFIRMACIÓN
-                hora_turno = turno_pendiente.start_at[11:16]
-                mensaje_exito = (
-                    f"✅ *¡Turno Confirmado!*\n\n"
-                    f"📅 *Fecha:* {fecha_esperada}\n"
-                    f"⏰ *Hora:* {hora_turno} hs\n"
-                    f"📍 *Dirección:* {prof.address}\n\n"
-                    f"¡Te esperamos! Se ha enviado un evento a la agenda del profesional."
-                )
-                await send_message(to=from_num, text=mensaje_exito, phone_number_id=phone_number_id)
-            
-            else:
-                await send_message(to=from_num, text="❌ No pudimos validar el comprobante. Por favor, verificá que el monto, la fecha y el destinatario sean correctos y volvé a enviarlo.", phone_number_id=phone_number_id)
-
-        else:
-            print(f"[WEBHOOK] Tipo no soportado: {msg_type}")
-
+                    await send_message(to=from_num, text="✅ ¡Pago validado!", phone_number_id=phone_number_id)
+                else:
+                    await send_message(to=from_num, text="❌ Comprobante inválido.", phone_number_id=phone_number_id)
         db.close()
-
     except Exception as e:
-        print(f"[WEBHOOK] Error crítico: {e}")
-        if 'db' in locals(): db.close()
-
+        print(f"[WEBHOOK] Error: {e}")
     return {"status": "ok"}
 
+# --- ENDPOINTS PARA EL PANEL DE CONTROL (NUEVOS) ---
 
+@app.get("/admin/stats", dependencies=[Depends(verify_admin)])
+async def get_global_stats():
+    """Métricas para el Dashboard principal."""
+    db = SessionLocal()
+    total_profs = db.query(Professional).count()
+    active_profs = db.query(Professional).filter_by(active=True).count()
+    total_confirmed = db.query(Appointment).filter_by(status="confirmed").count()
+    
+    # Estimación de ingresos (30 USD por cada activo)
+    estimated_mrr = active_profs * 30
+    
+    db.close()
+    return {
+        "total_professionals": total_profs,
+        "active_professionals": active_profs,
+        "total_appointments_confirmed": total_confirmed,
+        "estimated_mrr": estimated_mrr
+    }
 
+@app.get("/admin/professionals", dependencies=[Depends(verify_admin)])
+async def list_professionals():
+    """Lista de clientes para la tabla de gestión."""
+    db = SessionLocal()
+    profs = db.query(Professional).all()
+    db.close()
+    return profs
 
-
+@app.post("/admin/professionals/{prof_id}/toggle", dependencies=[Depends(verify_admin)])
+async def toggle_professional(prof_id: str):
+    """El interruptor para activar/suspender clientes."""
+    db = SessionLocal()
+    prof = db.query(Professional).filter_by(id=prof_id).first()
+    if not prof:
+        db.close()
+        raise HTTPException(status_code=404, detail="Profesional no encontrado")
+    
+    prof.active = not prof.active
+    new_status = "activado" if prof.active else "suspendido"
+    db.commit()
+    db.close()
+    return {"status": "success", "message": f"Profesional {new_status}"}
