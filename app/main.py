@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, HTTPException, Depends, Header
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
-
+from pydantic import BaseModel
 from app.config import VERIFY_TOKEN
 from app.bot import handle_message
 from app.database import init_db, SessionLocal, ProcessedMessage, Professional, Appointment
@@ -21,6 +21,18 @@ def verify_admin(x_admin_key: str = Header(None)):
     if x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Acceso denegado: API Key administrativa inválida")
     return True
+
+# Esquema para validar los datos que vienen del Panel de Control
+class ProfessionalCreate(BaseModel):
+    name: str
+    title: str
+    niche: str
+    session_price: float
+    phone_number_id: str
+    calendar_id: str
+    timezone: str = "America/Argentina/Buenos_Aires"
+    address: str = ""
+    active: bool = True
 
 @app.on_event("startup")
 def startup():
@@ -137,3 +149,33 @@ async def toggle_professional(prof_id: str):
     db.commit()
     db.close()
     return {"status": "success", "message": f"Profesional {new_status}"}
+
+@app.post("/admin/professionals", dependencies=[Depends(verify_admin)])
+async def create_professional(prof_data: ProfessionalCreate):
+    """Crea un nuevo cliente (Profesional) en la base de datos."""
+    db = SessionLocal()
+    try:
+        # Creamos la instancia del modelo de SQLAlchemy
+        new_prof = Professional(
+            name=prof_data.name,
+            title=prof_data.title,
+            niche=prof_data.niche,
+            session_price=prof_data.session_price,
+            phone_number_id=prof_data.phone_number_id,
+            calendar_id=prof_data.calendar_id,
+            timezone=prof_data.timezone,
+            address=prof_data.address,
+            active=prof_data.active
+        )
+        
+        db.add(new_prof)
+        db.commit()
+        db.refresh(new_prof)
+        return {"status": "success", "message": "Profesional creado", "id": new_prof.id}
+    
+    except Exception as e:
+        db.rollback()
+        print(f"[ADMIN] Error al crear profesional: {e}")
+        raise HTTPException(status_code=500, detail="Error interno al guardar en la base de datos")
+    finally:
+        db.close()
