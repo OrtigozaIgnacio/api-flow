@@ -10,7 +10,7 @@ st.markdown("Gestión centralizada de clientes, métricas y suscripciones.")
 
 # 2. BARRA LATERAL (Conexión de Seguridad)
 st.sidebar.header("Conexión al Servidor")
-API_URL = st.sidebar.text_input("URL del Backend", value="http://127.0.0.1:8000")
+API_URL = st.sidebar.text_input("URL del Backend", value="https://api-flow-o0v2.onrender.com")
 API_KEY = st.sidebar.text_input("Admin API Key", type="password", help="La clave secreta configurada en tu main.py")
 
 if not API_KEY:
